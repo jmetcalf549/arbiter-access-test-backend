@@ -18,10 +18,7 @@ function authOk(req) {
   return false;
 }
 
-// In-memory snapshot store keyed by runId so the polling client can see
-// progress (especially "waiting_for_manual_captcha") while the POST is
-// still in flight. Snapshots auto-expire 10 minutes after completion.
-const JOBS = new Map(); // runId -> { snapshot, doneAt? }
+const JOBS = new Map();
 const JOB_TTL_MS = 10 * 60 * 1000;
 
 function setJob(runId, snapshot) {
@@ -42,19 +39,23 @@ app.get("/health", (_req, res) => res.json({ ok: true, ts: new Date().toISOStrin
 
 async function handleTestLogin(req, res) {
   if (!authOk(req)) return res.status(401).json({ status: "failed", error_type: "unauthorized", error_message: "Bad shared secret." });
-  const {
-    username, password, browserbaseApiKey, browserbaseProjectId,
-    runId: clientRunId, manualCaptchaMode, captureFailureScreenshots,
-  } = req.body ?? {};
-  if (!username || !password) {
-    return res.status(400).json({ status: "failed", error_type: "missing_credentials", error_message: "username and password are required." });
+
+  const { cookies, browserbaseApiKey, browserbaseProjectId, runId: clientRunId, captureFailureScreenshots } = req.body ?? {};
+
+  if (!cookies) {
+    return res.status(400).json({
+      status: "failed",
+      error_type: "missing_cookies",
+      error_message: "cookies string is required. Export from browser DevTools > Application > Cookies.",
+    });
   }
+
   const runId = clientRunId || randomUUID();
   setJob(runId, { status: "starting", current_step: "queued", run_id: runId });
+
   try {
     const result = await runArbiterAutomation({
-      runId, username, password, browserbaseApiKey, browserbaseProjectId,
-      manualCaptchaMode: manualCaptchaMode === true,
+      runId, cookies, browserbaseApiKey, browserbaseProjectId,
       captureFailureScreenshots: captureFailureScreenshots !== false,
       onUpdate: (snap) => setJob(runId, { ...snap, run_id: runId }),
       logger: console,
