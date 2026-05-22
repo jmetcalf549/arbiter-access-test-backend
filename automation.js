@@ -4,6 +4,7 @@
 // - Screenshots at every major step (returned as base64 data URLs)
 // - Rich CAPTCHA detection (Cloudflare Turnstile / reCAPTCHA / hCaptcha / Arkose)
 // - Optional manual CAPTCHA mode (pause + return live debugger URL)
+// - Microsoft B2C SSO login flow support
 // Never logs username/password. Always cleans up browser + session.
 
 import { chromium } from "playwright-core";
@@ -31,6 +32,10 @@ const VIEWPORTS = [
 const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
+
+function isMicrosoftB2CUrl(url) {
+  return /arbitersportsb2c\.onmicrosoft\.com|b2clogin\.com|login\.microsoftonline\.com/.test(url);
+}
 
 function sanitizeUrl(u) {
   if (!u) return null;
@@ -94,16 +99,11 @@ async function releaseBrowserbaseSession({ apiKey, sessionId, logger }) {
 // ---------- Stealth ----------
 async function applyStealth(context) {
   await context.addInitScript(() => {
-    // navigator.webdriver
     Object.defineProperty(Navigator.prototype, "webdriver", { get: () => undefined });
-    // languages
     Object.defineProperty(navigator, "languages", { get: () => ["en-US", "en"] });
-    // plugins length
     Object.defineProperty(navigator, "plugins", { get: () => [1, 2, 3, 4, 5] });
-    // chrome runtime
     // @ts-ignore
     window.chrome = window.chrome || { runtime: {} };
-    // permissions query (notifications)
     const origQuery = window.navigator.permissions?.query;
     if (origQuery) {
       window.navigator.permissions.query = (p) =>
@@ -111,7 +111,6 @@ async function applyStealth(context) {
           ? Promise.resolve({ state: Notification.permission })
           : origQuery(p);
     }
-    // WebGL vendor/renderer spoof
     try {
       const getParam = WebGLRenderingContext.prototype.getParameter;
       WebGLRenderingContext.prototype.getParameter = function (p) {
@@ -134,6 +133,7 @@ async function humanMoveTo(page, locator) {
     await sleep(rand(80, 220));
   } catch {}
 }
+
 async function humanType(locator, text) {
   await locator.click({ delay: rand(40, 120) }).catch(() => {});
   for (const ch of text) {
@@ -142,7 +142,7 @@ async function humanType(locator, text) {
   }
 }
 
-// ---------- CAPTCHA detection (rich) ----------
+// ---------- CAPTCHA detection ----------
 async function detectCaptchaDetailed(page) {
   const url = page.url();
   const lowerUrl = url.toLowerCase();
@@ -186,7 +186,7 @@ function detectMfa(text) {
   return /(two[- ]factor|multi[- ]factor|verification code|authenticator|6-digit|verify your identity|enter the code)/i.test(text);
 }
 function detectInvalidCreds(text) {
-  return /(invalid (username|password|credentials)|incorrect (username|password)|unable to sign in|login failed|username or password.*incorrect|username and password do not match)/i.test(text);
+  return /(invalid (username|password|credentials)|incorrect (username|password)|unable to sign in|login failed|username or password.*incorrect|username and password do not match|your account or password is incorrect|we couldn't find an account)/i.test(text);
 }
 
 // ---------- Screenshots ----------
@@ -228,6 +228,7 @@ async function findSubmitLocator(page) {
     'button[type="submit"]', 'input[type="submit"]',
     'button:has-text("Sign In")', 'button:has-text("Log In")',
     'button:has-text("Login")', 'button:has-text("Continue")',
+    'button:has-text("Next")', 'button:has-text("Sign in")',
     'a:has-text("Sign In")',
   ];
   for (const s of sels) {
@@ -235,6 +236,166 @@ async function findSubmitLocator(page) {
     if (await loc.count().catch(() => 0)) return { loc, sel: s };
   }
   return null;
+}
+
+// ---------- Microsoft B2C login flow ----------
+// Arbiter redirects to Microsoft B2C which has a two-step flow:
+// Step 1: Enter email → click Next
+// Step 2: Enter password → click Sign in
+// Sometimes both fields are on one page; we handle both cases.
+async function handleMicrosoftB2CLogin({ page, username, password, screenshots, debug, captureFailureScreenshots, log }) {
+  log.log?.(`[b2c] detected Microsoft B2C login page url=${page.url()}`);
+  await snap(page, "b2c_initial", screenshots, captureFailureScreenshots);
+
+  // Wait for the page to settle
+  await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
+  await sleep(rand(600, 1200));
+
+  // --- Step 1: Email field ---
+  // B2C shows an email/username input first
+  const emailSelectors = [
+    'input[type="email"]',
+    'input[name="loginfmt"]',       // Microsoft's classic email field name
+    'input[id="i0116"]',            // Microsoft login email field id
+    'input[name*="email" i]',
+    'input[name*="user" i]',
+    'input[type="text"]',
+  ];
+
+  let emailField = null;
+  for (const sel of emailSelectors) {
+    const loc = page.locator(sel).first();
+    if (await loc.count().catch(() => 0) && await loc.isVisible().catch(() => false)) {
+      emailField = { loc, sel };
+      break;
+    }
+  }
+
+  if (!emailField) {
+    debug.b2c_email_field_missing = true;
+    await snap(page, "b2c_no_email_field", screenshots, captureFailureScreenshots);
+    throw new Error("microsoft_b2c_email_field_not_found");
+  }
+
+  debug.b2c_email_selector = emailField.sel;
+  log.log?.(`[b2c] filling email field sel=${emailField.sel}`);
+  await humanMoveTo(page, emailField.loc);
+  await emailField.loc.fill(""); // clear first
+  await humanType(emailField.loc, username);
+  await sleep(rand(300, 700));
+  await snap(page, "b2c_after_email", screenshots, captureFailureScreenshots);
+
+  // Check if password field is already visible (single-page flow)
+  let passField = await findPasswordLocator(page);
+  const singlePage = passField && await passField.loc.isVisible().catch(() => false);
+
+  if (!singlePage) {
+    // Two-step flow: click Next to proceed to password page
+    const nextSelectors = [
+      'input[type="submit"][value="Next"]',
+      'button:has-text("Next")',
+      'input[id="idSIButton9"]',      // Microsoft "Next" button id
+      'button[type="submit"]',
+      'input[type="submit"]',
+    ];
+
+    let nextBtn = null;
+    for (const sel of nextSelectors) {
+      const loc = page.locator(sel).first();
+      if (await loc.count().catch(() => 0) && await loc.isVisible().catch(() => false)) {
+        nextBtn = { loc, sel };
+        break;
+      }
+    }
+
+    if (nextBtn) {
+      debug.b2c_next_selector = nextBtn.sel;
+      log.log?.(`[b2c] clicking Next sel=${nextBtn.sel}`);
+      await humanMoveTo(page, nextBtn.loc);
+      await nextBtn.loc.click({ delay: rand(40, 120) });
+      await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
+      await sleep(rand(600, 1200));
+      await snap(page, "b2c_after_next", screenshots, captureFailureScreenshots);
+    }
+
+    // Now find the password field
+    passField = await findPasswordLocator(page);
+  }
+
+  if (!passField || !(await passField.loc.isVisible().catch(() => false))) {
+    // Check for "account not found" or similar errors
+    const bodyText = (await page.locator("body").innerText().catch(() => "")) || "";
+    if (/account.*not found|that microsoft account doesn't exist|no account found/i.test(bodyText)) {
+      throw new Error("microsoft_b2c_account_not_found");
+    }
+    debug.b2c_password_field_missing = true;
+    await snap(page, "b2c_no_password_field", screenshots, captureFailureScreenshots);
+    throw new Error("microsoft_b2c_password_field_not_found");
+  }
+
+  // --- Step 2: Password field ---
+  debug.b2c_password_selector = passField.sel;
+  log.log?.(`[b2c] filling password field sel=${passField.sel}`);
+  await humanMoveTo(page, passField.loc);
+  await passField.loc.fill(""); // clear first
+  await humanType(passField.loc, password);
+  await sleep(rand(300, 600));
+  await snap(page, "b2c_after_password", screenshots, captureFailureScreenshots);
+
+  // Click Sign In
+  const signInSelectors = [
+    'input[type="submit"][value="Sign in"]',
+    'input[id="idSIButton9"]',      // Microsoft "Sign in" button id
+    'button:has-text("Sign in")',
+    'button:has-text("Sign In")',
+    'button[type="submit"]',
+    'input[type="submit"]',
+  ];
+
+  let signInBtn = null;
+  for (const sel of signInSelectors) {
+    const loc = page.locator(sel).first();
+    if (await loc.count().catch(() => 0) && await loc.isVisible().catch(() => false)) {
+      signInBtn = { loc, sel };
+      break;
+    }
+  }
+
+  if (!signInBtn) {
+    // Fallback: press Enter on password field
+    log.log?.(`[b2c] no sign-in button found, pressing Enter`);
+    debug.b2c_signin_strategy = "Enter";
+    await passField.loc.press("Enter");
+  } else {
+    debug.b2c_signin_selector = signInBtn.sel;
+    log.log?.(`[b2c] clicking Sign In sel=${signInBtn.sel}`);
+    await humanMoveTo(page, signInBtn.loc);
+    await signInBtn.loc.click({ delay: rand(40, 120) });
+  }
+
+  await page.waitForLoadState("networkidle", { timeout: 25_000 }).catch(() => {});
+  await sleep(rand(800, 1500));
+  await snap(page, "b2c_after_signin", screenshots, captureFailureScreenshots);
+
+  // Handle "Stay signed in?" prompt (common after Microsoft login)
+  const staySignedInUrl = page.url();
+  const bodyAfter = (await page.locator("body").innerText().catch(() => "")) || "";
+  if (/stay signed in|keep me signed in|don't show this again/i.test(bodyAfter)) {
+    log.log?.(`[b2c] handling 'Stay signed in?' prompt`);
+    debug.b2c_stay_signed_in_prompt = true;
+    // Click "No" to avoid persistent session complications
+    const noBtn = page.locator('button:has-text("No"), input[value="No"]').first();
+    if (await noBtn.count().catch(() => 0)) {
+      await noBtn.click({ delay: rand(40, 100) });
+      await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
+      await sleep(rand(500, 1000));
+    }
+    await snap(page, "b2c_after_stay_signed_in", screenshots, captureFailureScreenshots);
+  }
+
+  debug.b2c_post_login_url = page.url();
+  log.log?.(`[b2c] login flow complete url=${page.url()}`);
+  return { postLoginUrl: page.url(), bodyText: bodyAfter };
 }
 
 async function discoverNavLinks(page) {
@@ -308,6 +469,7 @@ export async function runArbiterAutomation({
     stealth_mode_enabled: true,
     browser_connected: false,
     manual_captcha_mode: !!manualCaptchaMode,
+    b2c_flow_used: false,
   };
   const startedAt = Date.now();
 
@@ -370,8 +532,6 @@ export async function runArbiterAutomation({
     debug.browserbase_connect_url_sanitized = sanitizeUrl(session.wsUrl);
     timings.browserbase_connect_ms = Date.now() - t1;
 
-    // best-effort live debugger URL fetched synchronously up-front so the
-    // first update emitted to the polling client already includes it.
     try {
       const dbg = await fetchLiveDebuggerUrl({ apiKey, sessionId, logger: log });
       if (dbg) {
@@ -436,53 +596,89 @@ export async function runArbiterAutomation({
     }
     if (timedOut) throw new Error("hard_timeout");
 
-    // Find form
     setStep("entering_credentials");
-    const userField = await findUsernameLocator(page);
-    const passField = await findPasswordLocator(page);
-    debug.user_selector = userField?.sel ?? null;
-    debug.password_selector_used = passField ? "found" : "missing";
-    if (!passField) {
-      await snap(page, "login_failure", screenshots, captureFailureScreenshots);
-      return finish({ error_type: "login_form_not_found",
-        error_message: "Could not find a password field on the login page." }, "entering_credentials");
-    }
 
-    if (userField) {
-      await humanMoveTo(page, userField.loc);
-      await humanType(userField.loc, username);
-      await snap(page, "after_username", screenshots, captureFailureScreenshots);
-      await sleep(rand(250, 600));
-    }
-    await humanMoveTo(page, passField.loc);
-    await humanType(passField.loc, password);
-    await snap(page, "after_password", screenshots, captureFailureScreenshots);
-    await sleep(rand(300, 700));
+    // --- Detect if we are already on Microsoft B2C ---
+    if (isMicrosoftB2CUrl(page.url())) {
+      debug.b2c_flow_used = true;
+      log.log?.(`[automation] B2C redirect detected at login page, handling directly`);
+      setStep("microsoft_b2c_login");
+      try {
+        await handleMicrosoftB2CLogin({ page, username, password, screenshots, debug, captureFailureScreenshots, log });
+      } catch (b2cErr) {
+        const msg = b2cErr?.message || "";
+        if (msg.includes("account_not_found")) {
+          return finish({ invalid_credentials: true, error_type: "invalid_credentials",
+            error_message: "Microsoft B2C: account not found for this email." }, "checking_login_result");
+        }
+        return finish({ error_type: "b2c_login_error", error_message: msg }, "microsoft_b2c_login");
+      }
+    } else {
+      // Standard Arbiter login form
+      const userField = await findUsernameLocator(page);
+      const passField = await findPasswordLocator(page);
+      debug.user_selector = userField?.sel ?? null;
+      debug.password_selector_used = passField ? "found" : "missing";
 
-    // Re-check CAPTCHA before submit
-    cap = await detectCaptchaDetailed(page);
-    if (cap.detected) {
-      await handleCaptcha("after_credentials", cap);
-      if (!baseResult.captcha_resolved) {
-        baseResult.current_url = page.url();
-        baseResult.final_url = page.url();
-        return finish({}, "detecting_mfa_captcha");
+      if (!passField) {
+        await snap(page, "login_failure", screenshots, captureFailureScreenshots);
+        return finish({ error_type: "login_form_not_found",
+          error_message: "Could not find a password field on the login page." }, "entering_credentials");
+      }
+
+      if (userField) {
+        await humanMoveTo(page, userField.loc);
+        await humanType(userField.loc, username);
+        await snap(page, "after_username", screenshots, captureFailureScreenshots);
+        await sleep(rand(250, 600));
+      }
+      await humanMoveTo(page, passField.loc);
+      await humanType(passField.loc, password);
+      await snap(page, "after_password", screenshots, captureFailureScreenshots);
+      await sleep(rand(300, 700));
+
+      // Re-check CAPTCHA before submit
+      cap = await detectCaptchaDetailed(page);
+      if (cap.detected) {
+        await handleCaptcha("after_credentials", cap);
+        if (!baseResult.captcha_resolved) {
+          baseResult.current_url = page.url();
+          baseResult.final_url = page.url();
+          return finish({}, "detecting_mfa_captcha");
+        }
+      }
+
+      setStep("submitting_login");
+      const t3 = Date.now();
+      const submit = await findSubmitLocator(page);
+      if (submit) {
+        await humanMoveTo(page, submit.loc);
+        await submit.loc.click({ delay: rand(40, 120) }).catch(() => {});
+        debug.submit_strategy = submit.sel;
+      } else {
+        await passField.loc.press("Enter").catch(() => {});
+        debug.submit_strategy = "Enter";
+      }
+      await page.waitForLoadState("networkidle", { timeout: 25_000 }).catch(() => {});
+      timings.login_submit_ms = Date.now() - t3;
+
+      // --- Check if submit triggered a B2C redirect ---
+      if (isMicrosoftB2CUrl(page.url())) {
+        debug.b2c_flow_used = true;
+        log.log?.(`[automation] B2C redirect detected after submit, handling`);
+        setStep("microsoft_b2c_login");
+        try {
+          await handleMicrosoftB2CLogin({ page, username, password, screenshots, debug, captureFailureScreenshots, log });
+        } catch (b2cErr) {
+          const msg = b2cErr?.message || "";
+          if (msg.includes("account_not_found")) {
+            return finish({ invalid_credentials: true, error_type: "invalid_credentials",
+              error_message: "Microsoft B2C: account not found for this email." }, "checking_login_result");
+          }
+          return finish({ error_type: "b2c_login_error", error_message: msg }, "microsoft_b2c_login");
+        }
       }
     }
-
-    setStep("submitting_login");
-    const t3 = Date.now();
-    const submit = await findSubmitLocator(page);
-    if (submit) {
-      await humanMoveTo(page, submit.loc);
-      await submit.loc.click({ delay: rand(40, 120) }).catch(() => {});
-      debug.submit_strategy = submit.sel;
-    } else {
-      await passField.loc.press("Enter").catch(() => {});
-      debug.submit_strategy = "Enter";
-    }
-    await page.waitForLoadState("networkidle", { timeout: 25_000 }).catch(() => {});
-    timings.login_submit_ms = Date.now() - t3;
 
     debug.post_login_url = page.url();
     baseResult.current_url = page.url();
@@ -619,15 +815,12 @@ export async function runArbiterAutomation({
     debug.captcha_html_snippet = cap.htmlSnippet;
     debug.captcha_url_before = page.url();
     log.log?.(`[captcha] detected phase=${phase} kinds=${(baseResult.captcha_kinds||[]).join(",") || "generic"} url=${page.url()}`);
-    log.log?.(`[captcha] iframe_srcs=${JSON.stringify((cap.iframeSrcs || []).slice(0, 10))}`);
     try {
       const visibleText = await page.locator("body").innerText({ timeout: 3000 });
       debug.captcha_visible_text_preview = (visibleText || "").replace(/\s+/g, " ").slice(0, 2000);
-      log.log?.(`[captcha] visible_text="${(visibleText || "").replace(/\s+/g, " ").slice(0, 200)}"`);
     } catch {}
     await snap(page, `captcha_${phase}`, screenshots, true);
 
-    // Make sure we have the live debugger URL for manual solving
     if (!baseResult.debugger_url) {
       const dbg = await fetchLiveDebuggerUrl({ apiKey, sessionId, logger: log });
       if (dbg) {
@@ -645,9 +838,6 @@ export async function runArbiterAutomation({
       return;
     }
 
-    // Manual mode: surface "waiting_for_manual_captcha" to the polling
-    // client and keep the browser session alive while the user solves the
-    // CAPTCHA in the live Browserbase debugger window. Re-check every 2s.
     const startWait = Date.now();
     debug.manual_captcha_started_at_ms = Date.now() - startedAt;
     baseResult.captcha_wait_active = true;
