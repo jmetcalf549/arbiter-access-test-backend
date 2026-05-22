@@ -1,19 +1,16 @@
 // Browserbase + Playwright automation for Arbiter with stealth + diagnostics.
+// - Cookie-based authentication (skips login entirely)
 // - Human-like input (typing speed, jittered delays, mouse movement)
 // - Stealth context (UA, locale, timezone, viewport, navigator.webdriver mask)
 // - Screenshots at every major step (returned as base64 data URLs)
 // - Rich CAPTCHA detection (Cloudflare Turnstile / reCAPTCHA / hCaptcha / Arkose)
-// - Optional manual CAPTCHA mode (pause + return live debugger URL)
-// - Microsoft B2C SSO login flow support
-// Never logs username/password. Always cleans up browser + session.
+// Never logs credentials. Always cleans up browser + session.
 
 import { chromium } from "playwright-core";
 
-const HARD_TIMEOUT_MS = 360_000; // 6min cap so manual CAPTCHA solving has room
-const MANUAL_CAPTCHA_WAIT_MS = 180_000; // 3min manual-solve window
+const HARD_TIMEOUT_MS = 360_000;
 
-const ARBITER_LOGIN_URL =
-  process.env.ARBITER_LOGIN_URL || "https://www1.arbitersports.com/Official/Login.aspx";
+const ARBITER_HOME_URL = "https://www1.arbitersports.com/Official/Default.aspx";
 const ARBITER_SCHEDULE_URL = process.env.ARBITER_SCHEDULE_URL || null;
 const ARBITER_BLOCKS_URL = process.env.ARBITER_BLOCKS_URL || null;
 
@@ -33,10 +30,6 @@ const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const pick = (arr) => arr[Math.floor(Math.random() * arr.length)];
 
-function isMicrosoftB2CUrl(url) {
-  return /arbitersportsb2c\.onmicrosoft\.com|b2clogin\.com|login\.microsoftonline\.com/.test(url);
-}
-
 function sanitizeUrl(u) {
   if (!u) return null;
   try {
@@ -44,6 +37,28 @@ function sanitizeUrl(u) {
     if (url.searchParams.has("apiKey")) url.searchParams.set("apiKey", "[REDACTED]");
     return url.toString();
   } catch { return "[unparseable url]"; }
+}
+
+// Parse a cookie string like "name=value; name2=value2" into an array of
+// Playwright-compatible cookie objects for www1.arbitersports.com
+function parseCookieString(cookieStr, domain = "www1.arbitersports.com") {
+  if (!cookieStr) return [];
+  return cookieStr.split(";").map(s => s.trim()).filter(Boolean).map(pair => {
+    const idx = pair.indexOf("=");
+    if (idx === -1) return null;
+    const name = pair.slice(0, idx).trim();
+    const value = pair.slice(idx + 1).trim();
+    if (!name) return null;
+    return {
+      name,
+      value,
+      domain,
+      path: "/",
+      httpOnly: false,
+      secure: true,
+      sameSite: "None",
+    };
+  }).filter(Boolean);
 }
 
 async function createBrowserbaseSession({ apiKey, projectId, logger }) {
@@ -96,7 +111,6 @@ async function releaseBrowserbaseSession({ apiKey, sessionId, logger }) {
   } catch (e) { logger.warn?.(`[browserbase] release failed: ${e?.message}`); }
 }
 
-// ---------- Stealth ----------
 async function applyStealth(context) {
   await context.addInitScript(() => {
     Object.defineProperty(Navigator.prototype, "webdriver", { get: () => undefined });
@@ -122,74 +136,6 @@ async function applyStealth(context) {
   });
 }
 
-// ---------- Human-like interactions ----------
-async function humanMoveTo(page, locator) {
-  try {
-    const box = await locator.boundingBox();
-    if (!box) return;
-    const steps = rand(15, 30);
-    const target = { x: box.x + box.width / 2 + rand(-4, 4), y: box.y + box.height / 2 + rand(-3, 3) };
-    await page.mouse.move(target.x, target.y, { steps });
-    await sleep(rand(80, 220));
-  } catch {}
-}
-
-async function humanType(locator, text) {
-  await locator.click({ delay: rand(40, 120) }).catch(() => {});
-  for (const ch of text) {
-    await locator.type(ch, { delay: rand(40, 140) });
-    if (Math.random() < 0.07) await sleep(rand(100, 250));
-  }
-}
-
-// ---------- CAPTCHA detection ----------
-async function detectCaptchaDetailed(page) {
-  const url = page.url();
-  const lowerUrl = url.toLowerCase();
-  const flags = {
-    cloudflare_turnstile: false,
-    recaptcha: false,
-    hcaptcha: false,
-    arkose: false,
-    generic: false,
-  };
-  let matched = false;
-
-  if (/captcha|challenge|cf-chl|cloudflare/.test(lowerUrl)) {
-    flags.generic = true; matched = true;
-    if (/turnstile|cloudflare/.test(lowerUrl)) flags.cloudflare_turnstile = true;
-  }
-
-  const html = (await page.content().catch(() => "")) || "";
-  const lowerHtml = html.toLowerCase();
-  if (/turnstile|cf-turnstile|challenges\.cloudflare\.com/.test(lowerHtml)) { flags.cloudflare_turnstile = true; matched = true; }
-  if (/recaptcha|google\.com\/recaptcha|grecaptcha/.test(lowerHtml)) { flags.recaptcha = true; matched = true; }
-  if (/hcaptcha|h-captcha|hcaptcha\.com/.test(lowerHtml)) { flags.hcaptcha = true; matched = true; }
-  if (/arkoselabs|funcaptcha|enforcement\.arkoselabs/.test(lowerHtml)) { flags.arkose = true; matched = true; }
-  if (!matched && /are you a human|verify you are human|please verify|security check|prove you'?re human/.test(lowerHtml)) {
-    flags.generic = true; matched = true;
-  }
-
-  const iframeSrcs = await page.locator("iframe").evaluateAll(els => els.map(e => e.src || "")).catch(() => []);
-  for (const src of iframeSrcs) {
-    const s = (src || "").toLowerCase();
-    if (/turnstile|challenges\.cloudflare/.test(s)) { flags.cloudflare_turnstile = true; matched = true; }
-    if (/recaptcha/.test(s)) { flags.recaptcha = true; matched = true; }
-    if (/hcaptcha/.test(s)) { flags.hcaptcha = true; matched = true; }
-    if (/arkoselabs|funcaptcha/.test(s)) { flags.arkose = true; matched = true; }
-  }
-
-  return { detected: matched, flags, iframeSrcs, htmlSnippet: html.slice(0, 4000) };
-}
-
-function detectMfa(text) {
-  return /(two[- ]factor|multi[- ]factor|verification code|authenticator|6-digit|verify your identity|enter the code)/i.test(text);
-}
-function detectInvalidCreds(text) {
-  return /(invalid (username|password|credentials)|incorrect (username|password)|unable to sign in|login failed|username or password.*incorrect|username and password do not match|your account or password is incorrect|we couldn't find an account)/i.test(text);
-}
-
-// ---------- Screenshots ----------
 async function snap(page, label, screenshots, captureOnFailure) {
   if (!page) return;
   try {
@@ -198,204 +144,6 @@ async function snap(page, label, screenshots, captureOnFailure) {
   } catch (e) {
     if (captureOnFailure) screenshots[`${label}__error`] = String(e?.message || e).slice(0, 200);
   }
-}
-
-// ---------- Selector helpers ----------
-async function findUsernameLocator(page) {
-  const sels = [
-    'input[type="email"]',
-    'input[name*="user" i]', 'input[id*="user" i]',
-    'input[name*="email" i]', 'input[id*="email" i]',
-    'input[name*="login" i]',
-    'input[type="text"]:not([type="hidden"])',
-  ];
-  for (const s of sels) {
-    const loc = page.locator(s).first();
-    if (await loc.count().catch(() => 0)) return { loc, sel: s };
-  }
-  return null;
-}
-async function findPasswordLocator(page) {
-  const sels = ['input[type="password"]', 'input[name*="password" i]', 'input[id*="password" i]'];
-  for (const s of sels) {
-    const loc = page.locator(s).first();
-    if (await loc.count().catch(() => 0)) return { loc, sel: s };
-  }
-  return null;
-}
-async function findSubmitLocator(page) {
-  const sels = [
-    'button[type="submit"]', 'input[type="submit"]',
-    'button:has-text("Sign In")', 'button:has-text("Log In")',
-    'button:has-text("Login")', 'button:has-text("Continue")',
-    'button:has-text("Next")', 'button:has-text("Sign in")',
-    'a:has-text("Sign In")',
-  ];
-  for (const s of sels) {
-    const loc = page.locator(s).first();
-    if (await loc.count().catch(() => 0)) return { loc, sel: s };
-  }
-  return null;
-}
-
-// ---------- Microsoft B2C login flow ----------
-// Arbiter redirects to Microsoft B2C which has a two-step flow:
-// Step 1: Enter email → click Next
-// Step 2: Enter password → click Sign in
-// Sometimes both fields are on one page; we handle both cases.
-async function handleMicrosoftB2CLogin({ page, username, password, screenshots, debug, captureFailureScreenshots, log }) {
-  log.log?.(`[b2c] detected Microsoft B2C login page url=${page.url()}`);
-  await snap(page, "b2c_initial", screenshots, captureFailureScreenshots);
-
-  // Wait for the page to settle
-  await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
-  await sleep(rand(600, 1200));
-
-  // --- Step 1: Email field ---
-  // B2C shows an email/username input first
-  const emailSelectors = [
-    'input[type="email"]',
-    'input[name="loginfmt"]',       // Microsoft's classic email field name
-    'input[id="i0116"]',            // Microsoft login email field id
-    'input[name*="email" i]',
-    'input[name*="user" i]',
-    'input[type="text"]',
-  ];
-
-  let emailField = null;
-  for (const sel of emailSelectors) {
-    const loc = page.locator(sel).first();
-    if (await loc.count().catch(() => 0) && await loc.isVisible().catch(() => false)) {
-      emailField = { loc, sel };
-      break;
-    }
-  }
-
-  if (!emailField) {
-    debug.b2c_email_field_missing = true;
-    await snap(page, "b2c_no_email_field", screenshots, captureFailureScreenshots);
-    throw new Error("microsoft_b2c_email_field_not_found");
-  }
-
-  debug.b2c_email_selector = emailField.sel;
-  log.log?.(`[b2c] filling email field sel=${emailField.sel}`);
-  await humanMoveTo(page, emailField.loc);
-  await emailField.loc.fill(""); // clear first
-  await humanType(emailField.loc, username);
-  await sleep(rand(300, 700));
-  await snap(page, "b2c_after_email", screenshots, captureFailureScreenshots);
-
-  // Check if password field is already visible (single-page flow)
-  let passField = await findPasswordLocator(page);
-  const singlePage = passField && await passField.loc.isVisible().catch(() => false);
-
-  if (!singlePage) {
-    // Two-step flow: click Next to proceed to password page
-    const nextSelectors = [
-      'input[type="submit"][value="Next"]',
-      'button:has-text("Next")',
-      'input[id="idSIButton9"]',      // Microsoft "Next" button id
-      'button[type="submit"]',
-      'input[type="submit"]',
-    ];
-
-    let nextBtn = null;
-    for (const sel of nextSelectors) {
-      const loc = page.locator(sel).first();
-      if (await loc.count().catch(() => 0) && await loc.isVisible().catch(() => false)) {
-        nextBtn = { loc, sel };
-        break;
-      }
-    }
-
-    if (nextBtn) {
-      debug.b2c_next_selector = nextBtn.sel;
-      log.log?.(`[b2c] clicking Next sel=${nextBtn.sel}`);
-      await humanMoveTo(page, nextBtn.loc);
-      await nextBtn.loc.click({ delay: rand(40, 120) });
-      await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
-      await sleep(rand(600, 1200));
-      await snap(page, "b2c_after_next", screenshots, captureFailureScreenshots);
-    }
-
-    // Now find the password field
-    passField = await findPasswordLocator(page);
-  }
-
-  if (!passField || !(await passField.loc.isVisible().catch(() => false))) {
-    // Check for "account not found" or similar errors
-    const bodyText = (await page.locator("body").innerText().catch(() => "")) || "";
-    if (/account.*not found|that microsoft account doesn't exist|no account found/i.test(bodyText)) {
-      throw new Error("microsoft_b2c_account_not_found");
-    }
-    debug.b2c_password_field_missing = true;
-    await snap(page, "b2c_no_password_field", screenshots, captureFailureScreenshots);
-    throw new Error("microsoft_b2c_password_field_not_found");
-  }
-
-  // --- Step 2: Password field ---
-  debug.b2c_password_selector = passField.sel;
-  log.log?.(`[b2c] filling password field sel=${passField.sel}`);
-  await humanMoveTo(page, passField.loc);
-  await passField.loc.fill(""); // clear first
-  await humanType(passField.loc, password);
-  await sleep(rand(300, 600));
-  await snap(page, "b2c_after_password", screenshots, captureFailureScreenshots);
-
-  // Click Sign In
-  const signInSelectors = [
-    'input[type="submit"][value="Sign in"]',
-    'input[id="idSIButton9"]',      // Microsoft "Sign in" button id
-    'button:has-text("Sign in")',
-    'button:has-text("Sign In")',
-    'button[type="submit"]',
-    'input[type="submit"]',
-  ];
-
-  let signInBtn = null;
-  for (const sel of signInSelectors) {
-    const loc = page.locator(sel).first();
-    if (await loc.count().catch(() => 0) && await loc.isVisible().catch(() => false)) {
-      signInBtn = { loc, sel };
-      break;
-    }
-  }
-
-  if (!signInBtn) {
-    // Fallback: press Enter on password field
-    log.log?.(`[b2c] no sign-in button found, pressing Enter`);
-    debug.b2c_signin_strategy = "Enter";
-    await passField.loc.press("Enter");
-  } else {
-    debug.b2c_signin_selector = signInBtn.sel;
-    log.log?.(`[b2c] clicking Sign In sel=${signInBtn.sel}`);
-    await humanMoveTo(page, signInBtn.loc);
-    await signInBtn.loc.click({ delay: rand(40, 120) });
-  }
-
-  await page.waitForLoadState("networkidle", { timeout: 25_000 }).catch(() => {});
-  await sleep(rand(800, 1500));
-  await snap(page, "b2c_after_signin", screenshots, captureFailureScreenshots);
-
-  // Handle "Stay signed in?" prompt (common after Microsoft login)
-  const staySignedInUrl = page.url();
-  const bodyAfter = (await page.locator("body").innerText().catch(() => "")) || "";
-  if (/stay signed in|keep me signed in|don't show this again/i.test(bodyAfter)) {
-    log.log?.(`[b2c] handling 'Stay signed in?' prompt`);
-    debug.b2c_stay_signed_in_prompt = true;
-    // Click "No" to avoid persistent session complications
-    const noBtn = page.locator('button:has-text("No"), input[value="No"]').first();
-    if (await noBtn.count().catch(() => 0)) {
-      await noBtn.click({ delay: rand(40, 100) });
-      await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
-      await sleep(rand(500, 1000));
-    }
-    await snap(page, "b2c_after_stay_signed_in", screenshots, captureFailureScreenshots);
-  }
-
-  debug.b2c_post_login_url = page.url();
-  log.log?.(`[b2c] login flow complete url=${page.url()}`);
-  return { postLoginUrl: page.url(), bodyText: bodyAfter };
 }
 
 async function discoverNavLinks(page) {
@@ -442,21 +190,14 @@ async function extractRows(page) {
 }
 
 export async function runArbiterAutomation({
-  runId, username, password, browserbaseApiKey, browserbaseProjectId,
-  manualCaptchaMode = false, captureFailureScreenshots = true,
-  onUpdate, logger,
+  runId, cookies, browserbaseApiKey, browserbaseProjectId,
+  captureFailureScreenshots = true, onUpdate, logger,
 }) {
   const log = logger ?? console;
   const emit = (extra = {}) => {
     if (typeof onUpdate !== "function") return;
     try {
-      onUpdate({
-        ...baseResult,
-        ...extra,
-        current_step,
-        manual_captcha_mode: !!manualCaptchaMode,
-        duration_ms: Date.now() - startedAt,
-      });
+      onUpdate({ ...baseResult, ...extra, current_step, duration_ms: Date.now() - startedAt });
     } catch (e) { log.warn?.(`[automation] onUpdate failed: ${e?.message}`); }
   };
   const apiKey = browserbaseApiKey || process.env.BROWSERBASE_API_KEY;
@@ -465,12 +206,7 @@ export async function runArbiterAutomation({
   const timings = {};
   const screenshots = {};
   const redirectChain = [];
-  const debug = {
-    stealth_mode_enabled: true,
-    browser_connected: false,
-    manual_captcha_mode: !!manualCaptchaMode,
-    b2c_flow_used: false,
-  };
+  const debug = { stealth_mode_enabled: true, browser_connected: false, cookie_auth: true };
   const startedAt = Date.now();
 
   const baseResult = {
@@ -478,14 +214,7 @@ export async function runArbiterAutomation({
     current_step: "starting_browser",
     browser_connected: false,
     login_success: false,
-    mfa_detected: false,
-    captcha_detected: false,
-    captcha_kinds: null,
-    captcha_resolved: false,
-    captcha_wait_active: false,
-    remaining_wait_seconds: 0,
-    manual_captcha_mode: !!manualCaptchaMode,
-    invalid_credentials: false,
+    session_expired: false,
     schedule_found: false,
     blocks_found: false,
     games_found: 0,
@@ -509,12 +238,15 @@ export async function runArbiterAutomation({
   };
 
   if (!apiKey || !projectId) {
-    return {
-      ...baseResult,
-      error_type: "browserbase_credentials_missing",
+    return { ...baseResult, error_type: "browserbase_credentials_missing",
       error_message: "BROWSERBASE_API_KEY or BROWSERBASE_PROJECT_ID not set.",
-      duration_ms: Date.now() - startedAt,
-    };
+      duration_ms: Date.now() - startedAt };
+  }
+
+  if (!cookies) {
+    return { ...baseResult, error_type: "missing_cookies",
+      error_message: "cookies string is required for cookie-based auth.",
+      duration_ms: Date.now() - startedAt };
   }
 
   let browser = null, context = null, page = null, sessionId = null, timedOut = false;
@@ -539,8 +271,6 @@ export async function runArbiterAutomation({
         baseResult.live_debugger_url = dbg.debugger_url;
         baseResult.browserbase_session_url = dbg.browserbase_session_url;
         debug.debugger_url = dbg.debugger_url;
-        debug.debugger_fullscreen_url = dbg.debugger_fullscreen_url;
-        log.log?.(`[browserbase] debugger url ready session=${sessionId}`);
       }
     } catch {}
     emit();
@@ -555,177 +285,68 @@ export async function runArbiterAutomation({
 
     const existing = browser.contexts();
     context = existing.length ? existing[0] : await browser.newContext({
-      userAgent: ua,
-      viewport: vp,
-      locale: "en-US",
-      timezoneId: "America/Los_Angeles",
-      deviceScaleFactor: 1,
-      hasTouch: false,
-      isMobile: false,
+      userAgent: ua, viewport: vp, locale: "en-US",
+      timezoneId: "America/Los_Angeles", deviceScaleFactor: 1,
+      hasTouch: false, isMobile: false,
     });
     await applyStealth(context);
+
+    // Inject cookies before navigating
+    setStep("injecting_cookies");
+    const parsedCookies = parseCookieString(cookies);
+    debug.cookies_injected = parsedCookies.length;
+    log.log?.(`[auth] injecting ${parsedCookies.length} cookies`);
+    await context.addCookies(parsedCookies);
+
     page = context.pages()[0] ?? await context.newPage();
     page.setDefaultTimeout(20_000);
-
     page.on("framenavigated", (frame) => {
       if (frame === page.mainFrame()) redirectChain.push({ url: frame.url(), ts: Date.now() - startedAt });
     });
 
     if (timedOut) throw new Error("hard_timeout");
 
-    // Open login page
-    setStep("opening_login_page");
+    // Navigate directly to the home page (skipping login)
+    setStep("navigating_to_dashboard");
     const t2 = Date.now();
-    await page.goto(ARBITER_LOGIN_URL, { waitUntil: "domcontentloaded" });
+    await page.goto(ARBITER_HOME_URL, { waitUntil: "domcontentloaded" });
     await page.waitForLoadState("networkidle", { timeout: 15_000 }).catch(() => {});
-    await sleep(rand(800, 1600));
-    timings.arbiter_navigation_ms = Date.now() - t2;
-    debug.login_url = page.url();
+    await sleep(rand(800, 1500));
+    timings.navigation_ms = Date.now() - t2;
     baseResult.current_url = page.url();
-    await snap(page, "initial_login_page", screenshots, captureFailureScreenshots);
+    await snap(page, "dashboard", screenshots, captureFailureScreenshots);
 
-    // Pre-submit CAPTCHA check
-    let cap = await detectCaptchaDetailed(page);
-    if (cap.detected) {
-      await handleCaptcha("pre_submit", cap);
-      if (!baseResult.captcha_resolved) {
-        baseResult.current_url = page.url();
-        baseResult.final_url = page.url();
-        return finish({}, "detecting_mfa_captcha");
-      }
-    }
-    if (timedOut) throw new Error("hard_timeout");
-
-    setStep("entering_credentials");
-
-    // --- Detect if we are already on Microsoft B2C ---
-    if (isMicrosoftB2CUrl(page.url())) {
-      debug.b2c_flow_used = true;
-      log.log?.(`[automation] B2C redirect detected at login page, handling directly`);
-      setStep("microsoft_b2c_login");
-      try {
-        await handleMicrosoftB2CLogin({ page, username, password, screenshots, debug, captureFailureScreenshots, log });
-      } catch (b2cErr) {
-        const msg = b2cErr?.message || "";
-        if (msg.includes("account_not_found")) {
-          return finish({ invalid_credentials: true, error_type: "invalid_credentials",
-            error_message: "Microsoft B2C: account not found for this email." }, "checking_login_result");
-        }
-        return finish({ error_type: "b2c_login_error", error_message: msg }, "microsoft_b2c_login");
-      }
-    } else {
-      // Standard Arbiter login form
-      const userField = await findUsernameLocator(page);
-      const passField = await findPasswordLocator(page);
-      debug.user_selector = userField?.sel ?? null;
-      debug.password_selector_used = passField ? "found" : "missing";
-
-      if (!passField) {
-        await snap(page, "login_failure", screenshots, captureFailureScreenshots);
-        return finish({ error_type: "login_form_not_found",
-          error_message: "Could not find a password field on the login page." }, "entering_credentials");
-      }
-
-      if (userField) {
-        await humanMoveTo(page, userField.loc);
-        await humanType(userField.loc, username);
-        await snap(page, "after_username", screenshots, captureFailureScreenshots);
-        await sleep(rand(250, 600));
-      }
-      await humanMoveTo(page, passField.loc);
-      await humanType(passField.loc, password);
-      await snap(page, "after_password", screenshots, captureFailureScreenshots);
-      await sleep(rand(300, 700));
-
-      // Re-check CAPTCHA before submit
-      cap = await detectCaptchaDetailed(page);
-      if (cap.detected) {
-        await handleCaptcha("after_credentials", cap);
-        if (!baseResult.captcha_resolved) {
-          baseResult.current_url = page.url();
-          baseResult.final_url = page.url();
-          return finish({}, "detecting_mfa_captcha");
-        }
-      }
-
-      setStep("submitting_login");
-      const t3 = Date.now();
-      const submit = await findSubmitLocator(page);
-      if (submit) {
-        await humanMoveTo(page, submit.loc);
-        await submit.loc.click({ delay: rand(40, 120) }).catch(() => {});
-        debug.submit_strategy = submit.sel;
-      } else {
-        await passField.loc.press("Enter").catch(() => {});
-        debug.submit_strategy = "Enter";
-      }
-      await page.waitForLoadState("networkidle", { timeout: 25_000 }).catch(() => {});
-      timings.login_submit_ms = Date.now() - t3;
-
-      // --- Check if submit triggered a B2C redirect ---
-      if (isMicrosoftB2CUrl(page.url())) {
-        debug.b2c_flow_used = true;
-        log.log?.(`[automation] B2C redirect detected after submit, handling`);
-        setStep("microsoft_b2c_login");
-        try {
-          await handleMicrosoftB2CLogin({ page, username, password, screenshots, debug, captureFailureScreenshots, log });
-        } catch (b2cErr) {
-          const msg = b2cErr?.message || "";
-          if (msg.includes("account_not_found")) {
-            return finish({ invalid_credentials: true, error_type: "invalid_credentials",
-              error_message: "Microsoft B2C: account not found for this email." }, "checking_login_result");
-          }
-          return finish({ error_type: "b2c_login_error", error_message: msg }, "microsoft_b2c_login");
-        }
-      }
-    }
-
-    debug.post_login_url = page.url();
-    baseResult.current_url = page.url();
-    debug.post_login_title = await page.title().catch(() => null);
+    // Check if we got redirected back to login (session expired)
+    const currentUrl = page.url().toLowerCase();
     const bodyText = (await page.locator("body").innerText().catch(() => "")) || "";
-    debug.post_login_text_preview = bodyText.replace(/\s+/g, " ").slice(0, 2000);
-    await snap(page, "post_login", screenshots, captureFailureScreenshots);
+    const isLoginPage = /login|signin|sign-in|b2clogin|microsoftonline/.test(currentUrl);
 
-    if (timedOut) throw new Error("hard_timeout");
-
-    setStep("checking_login_result");
-    cap = await detectCaptchaDetailed(page);
-    if (cap.detected) {
-      await handleCaptcha("post_submit", cap);
-      if (!baseResult.captcha_resolved) {
-        baseResult.final_url = page.url();
-        return finish({}, "detecting_mfa_captcha");
-      }
+    if (isLoginPage) {
+      log.log?.(`[auth] session expired or cookies invalid, redirected to login`);
+      return finish({
+        session_expired: true,
+        error_type: "session_expired",
+        error_message: "Cookies are expired or invalid. Please re-export fresh cookies from your browser.",
+      }, "navigating_to_dashboard");
     }
-    const mfa = detectMfa(bodyText);
-    const invalid = detectInvalidCreds(bodyText);
-    const url = page.url().toLowerCase();
-    const lowText = bodyText.toLowerCase();
+
+    // Confirm we're logged in
     const looksAuthenticated =
-      !/login|signin|sign-in/.test(url) ||
-      /(logout|sign out|my schedule|my games|assignments|availability|blocks|calendar)/i.test(lowText);
+      /(logout|sign out|my schedule|my games|assignments|availability|blocks|calendar|john rush|dashboard)/i.test(bodyText);
 
-    if (mfa) {
-      await snap(page, "mfa_detected", screenshots, captureFailureScreenshots);
-      return finish({ mfa_detected: true, error_type: "mfa_required",
-        error_message: "MFA / two-factor verification required." }, "detecting_mfa_captcha");
-    }
-    if (invalid && !looksAuthenticated) {
-      await snap(page, "login_failure", screenshots, captureFailureScreenshots);
-      return finish({ invalid_credentials: true, error_type: "invalid_credentials",
-        error_message: "Arbiter rejected the username or password." }, "checking_login_result");
-    }
     if (!looksAuthenticated) {
-      await snap(page, "login_failure", screenshots, captureFailureScreenshots);
-      return finish({ error_type: "login_failed",
-        error_message: "Could not confirm successful login." }, "checking_login_result");
+      await snap(page, "auth_check_failed", screenshots, captureFailureScreenshots);
+      return finish({
+        session_expired: true,
+        error_type: "session_expired",
+        error_message: "Could not confirm authenticated session. Cookies may be expired.",
+      }, "navigating_to_dashboard");
     }
 
     baseResult.login_success = true;
-    await snap(page, "login_success", screenshots, captureFailureScreenshots);
+    log.log?.(`[auth] cookie auth successful, on dashboard`);
 
-    // Discover post-login navigation links
+    // Discover nav links
     setStep("looking_for_schedule");
     baseResult.discovered_links = await discoverNavLinks(page);
     debug.discovered_link_count = baseResult.discovered_links.length;
@@ -741,11 +362,9 @@ export async function runArbiterAutomation({
         const rows = await extractRows(page);
         baseResult.games = rows.map((r) => {
           const c = r.cells;
-          return {
-            date: c[0] || "", time: c[1] || "", sport: c[2] || "",
+          return { date: c[0] || "", time: c[1] || "", sport: c[2] || "",
             teams: c[3] || "", location: c[4] || "", role: c[5] || "",
-            status: c[6] || "", raw_text: r.raw_text,
-          };
+            status: c[6] || "", raw_text: r.raw_text };
         });
         baseResult.games_found = baseResult.games.length;
         baseResult.schedule_found = baseResult.games.length > 0;
@@ -767,10 +386,8 @@ export async function runArbiterAutomation({
         const rows = await extractRows(page);
         baseResult.blocks = rows.map((r) => {
           const c = r.cells;
-          return {
-            date: c[0] || "", start_time: c[1] || "", end_time: c[2] || "",
-            reason: c.slice(3).join(" ") || "", raw_text: r.raw_text,
-          };
+          return { date: c[0] || "", start_time: c[1] || "", end_time: c[2] || "",
+            reason: c.slice(3).join(" ") || "", raw_text: r.raw_text };
         });
         baseResult.blocks_found_count = baseResult.blocks.length;
         baseResult.blocks_found = baseResult.blocks.length > 0;
@@ -788,6 +405,7 @@ export async function runArbiterAutomation({
       baseResult.login_success ? "partial_success" : "failed";
 
     return finish({ status }, "returning_results");
+
   } catch (err) {
     const isTimeout = timedOut || err?.message === "hard_timeout";
     if (page && captureFailureScreenshots) await snap(page, "crash", screenshots, true);
@@ -805,83 +423,12 @@ export async function runArbiterAutomation({
     log.log?.(`[arbiter] finished runId=${runId ?? "none"} duration=${Date.now() - startedAt}ms`);
   }
 
-  // ---- helpers that close over baseResult / debug / screenshots ----
-
-  async function handleCaptcha(phase, cap) {
-    baseResult.captcha_detected = true;
-    baseResult.captcha_kinds = Object.entries(cap.flags).filter(([, v]) => v).map(([k]) => k);
-    debug.captcha_phase = phase;
-    debug.captcha_iframe_srcs = cap.iframeSrcs?.slice(0, 20);
-    debug.captcha_html_snippet = cap.htmlSnippet;
-    debug.captcha_url_before = page.url();
-    log.log?.(`[captcha] detected phase=${phase} kinds=${(baseResult.captcha_kinds||[]).join(",") || "generic"} url=${page.url()}`);
-    try {
-      const visibleText = await page.locator("body").innerText({ timeout: 3000 });
-      debug.captcha_visible_text_preview = (visibleText || "").replace(/\s+/g, " ").slice(0, 2000);
-    } catch {}
-    await snap(page, `captcha_${phase}`, screenshots, true);
-
-    if (!baseResult.debugger_url) {
-      const dbg = await fetchLiveDebuggerUrl({ apiKey, sessionId, logger: log });
-      if (dbg) {
-        baseResult.debugger_url = dbg.debugger_url;
-        baseResult.live_debugger_url = dbg.debugger_url;
-        baseResult.browserbase_session_url = dbg.browserbase_session_url;
-        debug.debugger_url = dbg.debugger_url;
-      }
-    }
-
-    if (!manualCaptchaMode) {
-      baseResult.error_type = "captcha_detected";
-      baseResult.error_message = `CAPTCHA detected (${(baseResult.captcha_kinds || []).join(", ") || "generic"}) at ${phase}. Enable manual mode to solve via the live debugger.`;
-      emit();
-      return;
-    }
-
-    const startWait = Date.now();
-    debug.manual_captcha_started_at_ms = Date.now() - startedAt;
-    baseResult.captcha_wait_active = true;
-    baseResult.status = "waiting_for_manual_captcha";
-    baseResult.error_type = null;
-    baseResult.error_message = null;
-    log.log?.(`[captcha] manual mode active, waiting up to ${MANUAL_CAPTCHA_WAIT_MS}ms (debugger=${baseResult.debugger_url || "none"})`);
-    emit({ remaining_wait_seconds: Math.ceil(MANUAL_CAPTCHA_WAIT_MS / 1000) });
-
-    while (Date.now() - startWait < MANUAL_CAPTCHA_WAIT_MS) {
-      await sleep(2000);
-      if (timedOut) break;
-      const remaining = Math.max(0, Math.ceil((MANUAL_CAPTCHA_WAIT_MS - (Date.now() - startWait)) / 1000));
-      baseResult.remaining_wait_seconds = remaining;
-      const recheck = await detectCaptchaDetailed(page).catch(() => ({ detected: true }));
-      if (!recheck.detected) {
-        baseResult.captcha_resolved = true;
-        baseResult.captcha_wait_active = false;
-        baseResult.remaining_wait_seconds = 0;
-        debug.manual_captcha_resolved_in_ms = Date.now() - startWait;
-        debug.captcha_url_after = page.url();
-        log.log?.(`[captcha] resolved manually in ${Date.now() - startWait}ms url=${page.url()}`);
-        await snap(page, `captcha_${phase}_resolved`, screenshots, captureFailureScreenshots);
-        emit();
-        return;
-      }
-      emit({ remaining_wait_seconds: remaining });
-    }
-    baseResult.captcha_wait_active = false;
-    baseResult.remaining_wait_seconds = 0;
-    baseResult.error_type = "captcha_unresolved";
-    baseResult.error_message = `Manual CAPTCHA window (${MANUAL_CAPTCHA_WAIT_MS}ms) elapsed without resolution at ${phase}.`;
-    log.log?.(`[captcha] manual window elapsed unresolved at ${phase}`);
-    emit();
-  }
-
   function finish(overrides, step) {
     timings.total_duration_ms = Date.now() - startedAt;
     if (page) {
       try { baseResult.final_url = baseResult.final_url || page.url(); } catch {}
       try { baseResult.current_url = page.url(); } catch {}
     }
-    baseResult.captcha_wait_active = false;
-    baseResult.remaining_wait_seconds = 0;
     const out = { ...baseResult, ...overrides, current_step: step, duration_ms: timings.total_duration_ms };
     if (!out.status || out.status === "failed") {
       if (out.login_success && out.schedule_found && out.blocks_found) out.status = "success";
